@@ -27,10 +27,36 @@ interface MediaPipeHands {
 const GRID_SIZE = 10;
 const MIN_STAR_SIZE = 1;
 const MAX_STAR_SIZE = 3;
+const MEDIAPIPE_SCRIPT_ID = "mediapipe-hands-script";
+const MEDIAPIPE_SCRIPT_SRC = "https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js";
+const SCRIPT_LOAD_TIMEOUT_MS = 10000;
 
 // Fingertip landmark indices
 const FINGERTIP_INDICES = [4, 8, 12, 16, 20];
 const WRIST_INDEX = 0;
+
+function getStartupErrorMessage(error: unknown): string {
+  if (error instanceof DOMException) {
+    if (error.name === "NotAllowedError" || error.name === "PermissionDeniedError") {
+      return "Camera access was blocked by your browser or preview permissions.";
+    }
+    if (error.name === "NotFoundError") {
+      return "No camera was found on this device.";
+    }
+    if (error.name === "NotReadableError") {
+      return "Camera is currently busy in another app or tab.";
+    }
+  }
+
+  if (error instanceof Error) {
+    if (error.message.includes("secure context")) {
+      return "Camera access requires a secure context (HTTPS or localhost).";
+    }
+    return error.message;
+  }
+
+  return "Unable to initialize camera and hand tracking.";
+}
 
 // Draw a star shape
 function drawStar(ctx: CanvasRenderingContext2D, cx: number, cy: number, size: number, points: number) {
@@ -68,7 +94,51 @@ export default function Home() {
   const [currentVolume, setCurrentVolume] = useState(0);
   const [cameraStarted, setCameraStarted] = useState(false);
   const [permissionError, setPermissionError] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
+  const [startupErrorMessage, setStartupErrorMessage] = useState<string | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+
+  const loadMediaPipeScript = useCallback(async () => {
+    if ((window as unknown as { Hands?: unknown }).Hands) {
+      return;
+    }
+
+    const existingScript = document.getElementById(MEDIAPIPE_SCRIPT_ID) as HTMLScriptElement | null;
+
+    await new Promise<void>((resolve, reject) => {
+      const script = existingScript ?? document.createElement("script");
+
+      const onLoad = () => {
+        cleanup();
+        resolve();
+      };
+
+      const onError = () => {
+        cleanup();
+        reject(new Error("Hand tracking library failed to load in this preview."));
+      };
+
+      const timeoutId = window.setTimeout(() => {
+        cleanup();
+        reject(new Error("Timed out while loading hand tracking library."));
+      }, SCRIPT_LOAD_TIMEOUT_MS);
+
+      const cleanup = () => {
+        window.clearTimeout(timeoutId);
+        script.removeEventListener("load", onLoad);
+        script.removeEventListener("error", onError);
+      };
+
+      script.addEventListener("load", onLoad);
+      script.addEventListener("error", onError);
+
+      if (!existingScript) {
+        script.id = MEDIAPIPE_SCRIPT_ID;
+        script.src = MEDIAPIPE_SCRIPT_SRC;
+        document.head.appendChild(script);
+      }
+    });
+  }, []);
 
   const drawHalftone = useCallback((ctx: CanvasRenderingContext2D, video: HTMLVideoElement, width: number, height: number) => {
     // Check if video is ready
@@ -197,17 +267,36 @@ export default function Home() {
   }, [updateAudio]);
 
   const startExperience = async () => {
+    if (isStarting || cameraStarted) return;
+
+    setIsStarting(true);
+    setPermissionError(false);
+    setStartupErrorMessage(null);
+
     try {
-      // Start audio first
-      await Tone.start();
-      
-      const gain = new Tone.Gain(0).toDestination();
-      const osc = new Tone.Oscillator(200, "sine").connect(gain);
-      osc.start();
-      
-      oscillatorRef.current = osc;
-      gainNodeRef.current = gain;
+      if (!window.isSecureContext) {
+        throw new Error("Camera access requires a secure context.");
+      }
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("Camera API is unavailable in this preview context.");
+      }
+
+      // Hide entry screen immediately so repeated clicks do not stack startup attempts.
       setAudioStarted(true);
+
+      // Start audio first, but do not block camera startup on audio failures.
+      try {
+        await Tone.start();
+
+        const gain = new Tone.Gain(0).toDestination();
+        const osc = new Tone.Oscillator(200, "sine").connect(gain);
+        osc.start();
+
+        oscillatorRef.current = osc;
+        gainNodeRef.current = gain;
+      } catch (audioErr) {
+        console.warn("[v0] Audio could not be initialized:", audioErr);
+      }
 
       // Request webcam
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -240,70 +329,92 @@ export default function Home() {
       videoRef.current = video;
 
       // Load MediaPipe Hands from CDN
-      const script = document.createElement("script");
-      script.src = "https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js";
-      script.onload = () => {
-        const Hands = (window as unknown as { Hands: new (config: { locateFile: (file: string) => string }) => MediaPipeHands }).Hands;
-        
-        const hands = new Hands({
-          locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
-        });
-        
-        hands.setOptions({
-          maxNumHands: 1,
-          modelComplexity: 1,
-          minDetectionConfidence: 0.7,
-          minTrackingConfidence: 0.5,
-        });
-        
-        hands.onResults(onResults);
-        handsRef.current = hands;
-        setCameraStarted(true);
-        
-        // Render loop with proper frame timing
-        let lastFrameTime = 0;
-        const targetFrameTime = 1000 / 30; // 30fps
-        
-        const render = async (currentTime: number) => {
-          if (currentTime - lastFrameTime >= targetFrameTime) {
-            lastFrameTime = currentTime;
-            
-            const canvas = canvasRef.current;
-            const ctx = canvas?.getContext("2d");
-            const video = videoRef.current;
-            
-            if (canvas && ctx && video && mediaReadyRef.current && video.readyState >= 2) {
-              canvas.width = window.innerWidth;
-              canvas.height = window.innerHeight;
-              
-              // Send frame to MediaPipe
-              if (handsRef.current) {
-                try {
-                  await handsRef.current.send({ image: video });
-                } catch (e) {
-                  // Ignore send errors
-                }
-              }
-              
-              // Draw halftone effect
-              drawHalftone(ctx, video, canvas.width, canvas.height);
-              
-              // Draw landmarks on top
-              if (landmarksRef.current) {
-                drawLandmarks(ctx, landmarksRef.current, canvas.width, canvas.height);
+      await loadMediaPipeScript();
+      const Hands = (window as unknown as {
+        Hands?: new (config: { locateFile: (file: string) => string }) => MediaPipeHands;
+      }).Hands;
+
+      if (!Hands) {
+        throw new Error("Hand tracking did not initialize after library load.");
+      }
+
+      const hands = new Hands({
+        locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+      });
+
+      hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.5,
+      });
+
+      hands.onResults(onResults);
+      handsRef.current = hands;
+      setCameraStarted(true);
+
+      // Render loop with proper frame timing
+      let lastFrameTime = 0;
+      const targetFrameTime = 1000 / 30; // 30fps
+
+      cancelAnimationFrame(animationRef.current);
+
+      const render = async (currentTime: number) => {
+        if (currentTime - lastFrameTime >= targetFrameTime) {
+          lastFrameTime = currentTime;
+
+          const canvas = canvasRef.current;
+          const ctx = canvas?.getContext("2d");
+          const video = videoRef.current;
+
+          if (canvas && ctx && video && mediaReadyRef.current && video.readyState >= 2) {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+
+            // Send frame to MediaPipe
+            if (handsRef.current) {
+              try {
+                await handsRef.current.send({ image: video });
+              } catch (_e) {
+                // Ignore per-frame send errors and continue rendering.
               }
             }
+
+            // Draw halftone effect
+            drawHalftone(ctx, video, canvas.width, canvas.height);
+
+            // Draw landmarks on top
+            if (landmarksRef.current) {
+              drawLandmarks(ctx, landmarksRef.current, canvas.width, canvas.height);
+            }
           }
-          
-          animationRef.current = requestAnimationFrame(render);
-        };
-        
+        }
+
         animationRef.current = requestAnimationFrame(render);
       };
-      document.head.appendChild(script);
+
+      animationRef.current = requestAnimationFrame(render);
     } catch (err) {
       console.error("[v0] Error starting experience:", err);
       setPermissionError(true);
+      setStartupErrorMessage(getStartupErrorMessage(err));
+      setAudioStarted(false);
+      setCameraStarted(false);
+      setCurrentHz(0);
+      setCurrentVolume(0);
+      oscillatorRef.current?.stop();
+      oscillatorRef.current?.dispose();
+      gainNodeRef.current?.dispose();
+      oscillatorRef.current = null;
+      gainNodeRef.current = null;
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop());
+      }
+      streamRef.current = null;
+      mediaReadyRef.current = false;
+      landmarksRef.current = null;
+    } finally {
+      setIsStarting(false);
     }
   };
 
@@ -335,9 +446,10 @@ export default function Home() {
           <div className="text-white/60 text-sm font-mono mb-2">Hand Instrument</div>
           <button
             onClick={startExperience}
-            className="px-6 py-3 bg-white/10 hover:bg-white/20 text-white font-mono text-sm rounded transition-colors"
+            disabled={isStarting}
+            className="px-6 py-3 bg-white/10 hover:bg-white/20 disabled:opacity-50 disabled:cursor-not-allowed text-white font-mono text-sm rounded transition-colors"
           >
-            Enable Webcam
+            {isStarting ? "Starting..." : "Enable Webcam"}
           </button>
           <div className="text-white/40 text-xs font-mono mt-2">Requires camera and audio access</div>
         </div>
@@ -347,7 +459,10 @@ export default function Home() {
         <div className="fixed inset-0 bg-[#0a0a12] flex flex-col items-center justify-center gap-4 p-8">
           <div className="text-red-400 text-sm font-mono mb-2">Camera Access Blocked</div>
           <div className="text-white/60 text-xs font-mono text-center max-w-md leading-relaxed">
-            Camera access is blocked in this preview. To use this app:
+            {startupErrorMessage ?? "Camera access is blocked in this preview."}
+          </div>
+          <div className="text-white/50 text-xs font-mono text-center max-w-md leading-relaxed">
+            To use this app:
           </div>
           <ol className="text-white/50 text-xs font-mono text-left list-decimal list-inside space-y-2 mt-2">
             <li>Click the &quot;Open in new tab&quot; button (top right of preview)</li>
@@ -355,9 +470,16 @@ export default function Home() {
             <li>Allow camera access when prompted by your browser</li>
           </ol>
           <button
+            onClick={() => window.open(window.location.href, "_blank", "noopener,noreferrer")}
+            className="mt-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white font-mono text-xs rounded transition-colors"
+          >
+            Open in New Tab
+          </button>
+          <button
             onClick={() => {
               setPermissionError(false);
               setAudioStarted(false);
+              setStartupErrorMessage(null);
             }}
             className="mt-4 px-4 py-2 bg-white/10 hover:bg-white/20 text-white font-mono text-xs rounded transition-colors"
           >
