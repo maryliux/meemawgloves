@@ -30,6 +30,8 @@ const MAX_STAR_SIZE = 3;
 const MEDIAPIPE_SCRIPT_ID = "mediapipe-hands-script";
 const MEDIAPIPE_SCRIPT_SRC = "https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js";
 const SCRIPT_LOAD_TIMEOUT_MS = 10000;
+const CAMERA_REQUEST_TIMEOUT_MS = 12000;
+const VIDEO_READY_TIMEOUT_MS = 10000;
 
 // Fingertip landmark indices
 const FINGERTIP_INDICES = [4, 8, 12, 16, 20];
@@ -56,6 +58,24 @@ function getStartupErrorMessage(error: unknown): string {
   }
 
   return "Unable to initialize camera and hand tracking.";
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => {
+      reject(new Error(timeoutMessage));
+    }, ms);
+
+    promise
+      .then((value) => {
+        window.clearTimeout(timeoutId);
+        resolve(value);
+      })
+      .catch((error) => {
+        window.clearTimeout(timeoutId);
+        reject(error);
+      });
+  });
 }
 
 // Draw a star shape
@@ -89,14 +109,31 @@ export default function Home() {
   const landmarksRef = useRef<HandLandmark[] | null>(null);
   const mediaReadyRef = useRef(false);
 
-  const [audioStarted, setAudioStarted] = useState(false);
   const [currentHz, setCurrentHz] = useState(0);
   const [currentVolume, setCurrentVolume] = useState(0);
   const [cameraStarted, setCameraStarted] = useState(false);
   const [permissionError, setPermissionError] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
+  const [startupStep, setStartupStep] = useState("");
   const [startupErrorMessage, setStartupErrorMessage] = useState<string | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+
+  const cleanupExperience = useCallback(() => {
+    cancelAnimationFrame(animationRef.current);
+    oscillatorRef.current?.stop();
+    oscillatorRef.current?.dispose();
+    gainNodeRef.current?.dispose();
+    oscillatorRef.current = null;
+    gainNodeRef.current = null;
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+    }
+    streamRef.current = null;
+    videoRef.current = null;
+    handsRef.current = null;
+    mediaReadyRef.current = false;
+    landmarksRef.current = null;
+  }, []);
 
   const loadMediaPipeScript = useCallback(async () => {
     if ((window as unknown as { Hands?: unknown }).Hands) {
@@ -270,8 +307,12 @@ export default function Home() {
     if (isStarting || cameraStarted) return;
 
     setIsStarting(true);
+    setStartupStep("Checking browser permissions...");
     setPermissionError(false);
     setStartupErrorMessage(null);
+    setCurrentHz(0);
+    setCurrentVolume(0);
+    cleanupExperience();
 
     try {
       if (!window.isSecureContext) {
@@ -281,33 +322,20 @@ export default function Home() {
         throw new Error("Camera API is unavailable in this preview context.");
       }
 
-      // Hide entry screen immediately so repeated clicks do not stack startup attempts.
-      setAudioStarted(true);
+      setStartupStep("Requesting camera permission...");
+      const stream = await withTimeout(
+        navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            facingMode: "user",
+            frameRate: { ideal: 30 },
+          },
+        }),
+        CAMERA_REQUEST_TIMEOUT_MS,
+        "Timed out waiting for camera permission. Open in new tab and allow camera access."
+      );
 
-      // Start audio first, but do not block camera startup on audio failures.
-      try {
-        await Tone.start();
-
-        const gain = new Tone.Gain(0).toDestination();
-        const osc = new Tone.Oscillator(200, "sine").connect(gain);
-        osc.start();
-
-        oscillatorRef.current = osc;
-        gainNodeRef.current = gain;
-      } catch (audioErr) {
-        console.warn("[v0] Audio could not be initialized:", audioErr);
-      }
-
-      // Request webcam
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { 
-          width: { ideal: 1280 }, 
-          height: { ideal: 720 }, 
-          facingMode: "user",
-          frameRate: { ideal: 30 }
-        }
-      });
-      
       streamRef.current = stream;
 
       // Create and setup video element
@@ -315,20 +343,33 @@ export default function Home() {
       video.srcObject = stream;
       video.playsInline = true;
       video.muted = true;
-      
-      // Wait for video to be ready
-      await new Promise<void>((resolve) => {
-        video.onloadedmetadata = () => {
-          video.play().then(() => {
-            mediaReadyRef.current = true;
-            resolve();
-          });
-        };
-      });
-      
+
+      setStartupStep("Preparing camera feed...");
+      await withTimeout(
+        new Promise<void>((resolve, reject) => {
+          video.onloadedmetadata = () => {
+            video
+              .play()
+              .then(() => {
+                mediaReadyRef.current = true;
+                resolve();
+              })
+              .catch((playError) => {
+                reject(playError);
+              });
+          };
+          video.onerror = () => {
+            reject(new Error("Video stream failed to start."));
+          };
+        }),
+        VIDEO_READY_TIMEOUT_MS,
+        "Camera started but video preview timed out."
+      );
+
       videoRef.current = video;
 
       // Load MediaPipe Hands from CDN
+      setStartupStep("Loading hand tracking...");
       await loadMediaPipeScript();
       const Hands = (window as unknown as {
         Hands?: new (config: { locateFile: (file: string) => string }) => MediaPipeHands;
@@ -352,6 +393,21 @@ export default function Home() {
       hands.onResults(onResults);
       handsRef.current = hands;
       setCameraStarted(true);
+      setStartupStep("");
+
+      // Start audio after camera is live, but do not block visual startup on audio failures.
+      try {
+        await Tone.start();
+
+        const gain = new Tone.Gain(0).toDestination();
+        const osc = new Tone.Oscillator(200, "sine").connect(gain);
+        osc.start();
+
+        oscillatorRef.current = osc;
+        gainNodeRef.current = gain;
+      } catch (audioErr) {
+        console.warn("[v0] Audio could not be initialized:", audioErr);
+      }
 
       // Render loop with proper frame timing
       let lastFrameTime = 0;
@@ -398,21 +454,11 @@ export default function Home() {
       console.error("[v0] Error starting experience:", err);
       setPermissionError(true);
       setStartupErrorMessage(getStartupErrorMessage(err));
-      setAudioStarted(false);
+      setStartupStep("");
       setCameraStarted(false);
       setCurrentHz(0);
       setCurrentVolume(0);
-      oscillatorRef.current?.stop();
-      oscillatorRef.current?.dispose();
-      gainNodeRef.current?.dispose();
-      oscillatorRef.current = null;
-      gainNodeRef.current = null;
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop());
-      }
-      streamRef.current = null;
-      mediaReadyRef.current = false;
-      landmarksRef.current = null;
+      cleanupExperience();
     } finally {
       setIsStarting(false);
     }
@@ -420,15 +466,9 @@ export default function Home() {
 
   useEffect(() => {
     return () => {
-      cancelAnimationFrame(animationRef.current);
-      oscillatorRef.current?.stop();
-      oscillatorRef.current?.dispose();
-      gainNodeRef.current?.dispose();
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop());
-      }
+      cleanupExperience();
     };
-  }, []);
+  }, [cleanupExperience]);
 
   return (
     <>
@@ -441,22 +481,30 @@ export default function Home() {
         </div>
       )}
       
-      {!audioStarted && !permissionError && (
-        <div className="fixed inset-0 bg-[#0a0a12] flex flex-col items-center justify-center gap-6">
+      {!cameraStarted && !permissionError && (
+        <div className="fixed inset-0 z-10 bg-[#0a0a12] flex flex-col items-center justify-center gap-6">
           <div className="text-white/60 text-sm font-mono mb-2">Hand Instrument</div>
           <button
             onClick={startExperience}
             disabled={isStarting}
             className="px-6 py-3 bg-white/10 hover:bg-white/20 disabled:opacity-50 disabled:cursor-not-allowed text-white font-mono text-sm rounded transition-colors"
           >
-            {isStarting ? "Starting..." : "Enable Webcam"}
+            {isStarting ? startupStep || "Starting..." : "Enable Webcam"}
           </button>
-          <div className="text-white/40 text-xs font-mono mt-2">Requires camera and audio access</div>
+          <div className="text-white/40 text-xs font-mono mt-2">
+            Requires camera and audio access
+          </div>
+          <button
+            onClick={() => window.open(window.location.href, "_blank", "noopener,noreferrer")}
+            className="text-white/50 hover:text-white text-xs font-mono underline underline-offset-2"
+          >
+            Open in New Tab First
+          </button>
         </div>
       )}
       
       {permissionError && (
-        <div className="fixed inset-0 bg-[#0a0a12] flex flex-col items-center justify-center gap-4 p-8">
+        <div className="fixed inset-0 z-10 bg-[#0a0a12] flex flex-col items-center justify-center gap-4 p-8">
           <div className="text-red-400 text-sm font-mono mb-2">Camera Access Blocked</div>
           <div className="text-white/60 text-xs font-mono text-center max-w-md leading-relaxed">
             {startupErrorMessage ?? "Camera access is blocked in this preview."}
@@ -478,8 +526,8 @@ export default function Home() {
           <button
             onClick={() => {
               setPermissionError(false);
-              setAudioStarted(false);
               setStartupErrorMessage(null);
+              setStartupStep("");
             }}
             className="mt-4 px-4 py-2 bg-white/10 hover:bg-white/20 text-white font-mono text-xs rounded transition-colors"
           >
